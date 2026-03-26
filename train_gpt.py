@@ -522,9 +522,16 @@ def restore_low_dim_params_to_fp32(module: nn.Module) -> None:
 
 
 class Rotary(nn.Module):
-    # Caches cos/sin tables per sequence length on the current device.
+    # RoPE (Rotary Position Embeddings). Generates cos/sin tables that encode
+    # position information. When applied to Q and K vectors, nearby tokens
+    # produce higher dot products and distant tokens produce lower ones.
+    # The model gets a built-in sense of distance without explicit position IDs.
+    # Results are cached so they're only computed once per sequence length.
     def __init__(self, dim: int, base: float = 10000.0):
         super().__init__()
+        # Each pair of dimensions gets a different rotation frequency.
+        # Low dimensions rotate fast (capture short-range position), high
+        # dimensions rotate slowly (capture long-range position).
         inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
         self.register_buffer("inv_freq", inv_freq, persistent=False)
         self._seq_len_cached = 0
@@ -538,7 +545,9 @@ class Rotary(nn.Module):
             or self._seq_len_cached != seq_len
             or self._cos_cached.device != device
         ):
+            # Position indices: [0, 1, 2, ..., seq_len-1].
             t = torch.arange(seq_len, device=device, dtype=self.inv_freq.dtype)
+            # Outer product: each position × each frequency = angle of rotation.
             freqs = torch.outer(t, self.inv_freq.to(device))
             self._cos_cached = freqs.cos()[None, None, :, :]
             self._sin_cached = freqs.sin()[None, None, :, :]
@@ -547,12 +556,18 @@ class Rotary(nn.Module):
 
 
 def apply_rotary_emb(x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
+    # Rotate pairs of dimensions in x by the position-dependent angle.
+    # Split each 64-dim head vector into two halves of 32, then apply a 2D
+    # rotation matrix to each pair. This is the actual "rotation" in RoPE.
     half = x.size(-1) // 2
     x1, x2 = x[..., :half], x[..., half:]
     return torch.cat((x1 * cos + x2 * sin, x1 * (-sin) + x2 * cos), dim=-1)
 
 
 class CausalSelfAttention(nn.Module):
+    # This is where Q/K/V and the actual attention computation live.
+    # Every position looks at every earlier position and asks "what's relevant
+    # to me?" then gathers information from those positions.
     def __init__(
         self,
         dim: int,
@@ -568,29 +583,46 @@ class CausalSelfAttention(nn.Module):
             raise ValueError("num_heads must be divisible by num_kv_heads")
         self.num_heads = num_heads
         self.num_kv_heads = num_kv_heads
+        # 512 / 8 heads = 64 dims per head.
         self.head_dim = dim // num_heads
         if self.head_dim % 2 != 0:
             raise ValueError("head_dim must be even for RoPE")
+        # GQA: 4 KV heads shared across 8 query heads. Each pair of query
+        # heads shares the same K and V, cutting KV parameter count in half.
         kv_dim = self.num_kv_heads * self.head_dim
+        # Three learned projections that create Q, K, V from the input.
+        # Q = "what am I looking for", K = "what do I advertise to others",
+        # V = "what I contribute when attended to."
         self.c_q = CastedLinear(dim, dim, bias=False)
         self.c_k = CastedLinear(dim, kv_dim, bias=False)
         self.c_v = CastedLinear(dim, kv_dim, bias=False)
+        # Project the gathered attention output back to dim 512.
         self.proj = CastedLinear(dim, dim, bias=False)
         self.proj._zero_init = True
+        # Per-head learned gain applied to queries after normalization.
         self.q_gain = nn.Parameter(torch.full((num_heads,), qk_gain_init, dtype=torch.float32))
+        # RoPE: encodes position by rotating Q and K vectors, so position
+        # info enters through the attention dot product.
         self.rotary = Rotary(self.head_dim, base=rope_base)
 
     def forward(self, x: Tensor) -> Tensor:
         bsz, seqlen, dim = x.shape
+        # Project input into Q, K, V, then reshape into separate heads.
+        # (batch, seq, 512) becomes (batch, num_heads, seq, 64).
         q = self.c_q(x).reshape(bsz, seqlen, self.num_heads, self.head_dim).transpose(1, 2)
         k = self.c_k(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
         v = self.c_v(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
+        # Normalize Q and K so dot products stay in a stable range.
         q = F.rms_norm(q, (q.size(-1),))
         k = F.rms_norm(k, (k.size(-1),))
+        # Apply rotary position embeddings to Q and K.
         cos, sin = self.rotary(seqlen, x.device, q.dtype)
         q = apply_rotary_emb(q, cos, sin)
         k = apply_rotary_emb(k, cos, sin)
         q = q * self.q_gain.to(dtype=q.dtype)[None, :, None, None]
+        # The actual attention: softmax(QK^T / sqrt(d_k)) * V.
+        # is_causal=True masks future positions so each token only attends
+        # to earlier tokens (autoregressive).
         y = F.scaled_dot_product_attention(
             q,
             k,
@@ -599,25 +631,37 @@ class CausalSelfAttention(nn.Module):
             is_causal=True,
             enable_gqa=(self.num_kv_heads != self.num_heads),
         )
+        # Concatenate heads back together and project to 512.
         y = y.transpose(1, 2).contiguous().reshape(bsz, seqlen, dim)
         return self.proj(y)
 
 
 class MLP(nn.Module):
-    # relu^2 MLP from the original modded-nanogpt setup
+    # If attention is "gather info from other tokens," MLP is "process the
+    # info at this token." Same weights applied independently at every position.
     def __init__(self, dim: int, mlp_mult: int):
         super().__init__()
         hidden = mlp_mult * dim
+        # Expand to a bigger space (512 to 1024 with mlp_mult=2) where the
+        # model can do more complex transformations.
         self.fc = CastedLinear(dim, hidden, bias=False)
+        # Compress back down (1024 to 512).
         self.proj = CastedLinear(hidden, dim, bias=False)
         self.proj._zero_init = True
 
     def forward(self, x: Tensor) -> Tensor:
+        # fc computes 1024 "questions" about the 512 input numbers.
+        # ReLU zeroes out the negative ones, acting as a gate: "this question
+        # is relevant, keep it" (positive) or "not relevant, shut it off."
         x = torch.relu(self.fc(x))
+        # Square the survivors (ReLU squared), then project back to 512.
         return self.proj(x.square())
 
 
 class Block(nn.Module):
+    # Each block: blend in original embedding, attention with residual, MLP with residual.
+    # GPT.forward calls this 9 times. The shape stays (batch, seq, 512) the whole way
+    # through. What changes is the information content of those 512 numbers.
     def __init__(
         self,
         dim: int,
@@ -628,19 +672,34 @@ class Block(nn.Module):
         qk_gain_init: float,
     ):
         super().__init__()
+        # Normalization before each sublayer. Rescales the 512 numbers to a
+        # consistent range so attention/MLP get sensible inputs.
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
         self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
         self.mlp = MLP(dim, mlp_mult)
+        # Per-channel (dim 512) learned scalars controlling how much each
+        # sublayer's output contributes to the residual. Start at 1.
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
+        # resid_mix: row 0 weights how much of current x to keep, row 1
+        # weights how much of the original embedding x0 to mix back in.
+        # Starts as [1, 0] (no-op), model learns the ratio during training.
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
 
     def forward(self, x: Tensor, x0: Tensor) -> Tensor:
+        # Blend current representation with original embedding. After several
+        # blocks, x gets very processed. This lets the block peek at the raw
+        # input if that helps. [None, None, :] is broadcasting so the 512-dim
+        # vector multiplies across every batch element and sequence position.
         mix = self.resid_mix.to(dtype=x.dtype)
         x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
+        # Sublayer 1: normalize, attend, scale, add back. The + is the
+        # residual connection. Attention doesn't replace x, it adds to it.
+        # Worst case a bad layer adds zeros (contributes nothing).
         attn_out = self.attn(self.attn_norm(x))
         x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
+        # Sublayer 2: same pattern. Normalize, MLP, scale, add back.
         x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
         return x
 
@@ -698,29 +757,56 @@ class GPT(nn.Module):
                 nn.init.zeros_(module.weight)
 
     def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
+        # Each token ID becomes a 512-dimensional vector. This is the
+        # embedding lookup from the Illustrated Transformer.
         x = self.tok_emb(input_ids)
+        # Normalize the embeddings, then save a copy as x0. This original
+        # embedding gets passed into every Block — that's what the resid_mix
+        # parameter blends with, letting later layers "remember" the raw input.
         x = F.rms_norm(x, (x.size(-1),))
         x0 = x
         skips: list[Tensor] = []
 
-        # First half stores skips; second half reuses them in reverse order.
+        # Run blocks 0-3, saving each output. This is the "encoder" half
+        # of the U-Net skip connection pattern.
         for i in range(self.num_encoder_layers):
             x = self.blocks[i](x, x0)
             skips.append(x)
+        # Run blocks 4-8. Before each one, add the saved output from the
+        # encoder half in reverse order. skips.pop() grabs the most recent
+        # first, so block 4 gets block 3's output, block 5 gets block 2's,
+        # etc. skip_weights control how much influence each skip has — they're
+        # per-channel (dim 512), not scalar, so the model weights each
+        # feature dimension differently. Gives deeper layers a shortcut
+        # back to earlier representations.
         for i in range(self.num_decoder_layers):
             if skips:
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
             x = self.blocks[self.num_encoder_layers + i](x, x0)
 
+        # Final normalization, then flatten from (batch, seq, 512) to
+        # (batch*seq, 512) so each token position gets scored independently.
         x = self.final_norm(x).reshape(-1, x.size(-1))
         targets = target_ids.reshape(-1)
+        # Tied embeddings: instead of a separate output layer, reuse the same
+        # embedding matrix to project from 512 dims back to 1024 vocab logits.
+        # F.linear(x, W) computes x @ W^T — exactly the reverse of the
+        # embedding lookup. One matrix for input and output, halving the
+        # parameter cost.
         if self.tie_embeddings:
             logits_proj = F.linear(x, self.tok_emb.weight)
         else:
             if self.lm_head is None:
                 raise RuntimeError("lm_head is required when tie_embeddings=False")
             logits_proj = self.lm_head(x)
+        # Squash logits so they can't grow beyond ±30 (the logit_softcap value).
+        # tanh scaled to asymptote at 30 instead of 1. Prevents the model from
+        # becoming overconfident on any single token — same spirit as label
+        # smoothing from Alammar's post, applied differently.
         logits = self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
+        # The loss function. Compares predicted probability distribution against
+        # the actual next tokens. This single number gets backpropagated to
+        # update all weights — lower loss = better compression = lower BPB.
         return F.cross_entropy(logits.float(), targets, reduction="mean")
 
 
